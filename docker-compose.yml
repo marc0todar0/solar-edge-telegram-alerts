@@ -1,0 +1,9 @@
+services:
+  telegram-bot:
+    build: .
+    image: solar-edge-tg-bot
+    container_name: solar-edge-tg-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+
