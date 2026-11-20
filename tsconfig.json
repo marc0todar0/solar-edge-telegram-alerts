@@ -1,9 +1,12 @@
 {
-  "extends": "@tsconfig/node12/tsconfig.json",
   "compilerOptions": {
+    "target": "ES2022",
     "module": "CommonJS",
+    "lib": ["ES2022"],
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
     "outDir": "dist"
   },
-  "include": ["src/bot.ts", "environment.d.ts"],
-  "exclude": ["node_modules"]
+  "include": ["src/**/*.ts", "environment.d.ts"]
 }

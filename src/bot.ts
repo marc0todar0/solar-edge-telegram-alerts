@@ -1,191 +1,123 @@
-import { Bot, webhookCallback } from "grammy";
-import express from "express";
-import DuckTimer from "duck-timer";
-import axios from "axios";
+import { Bot } from "grammy";
+import { AuthError, getSnapshot, Snapshot } from "./solaredge";
 require("dotenv").config();
 
-/* BOT */
-// Create a bot using the Telegram token
-const bot = new Bot(process.env.TELEGRAM_TOKEN || "");
-// Suggest commands in the menu
-bot.api.setMyCommands([
-  { command: "yo", description: "Be greeted by the bot" },
-  { command: "now", description: "per ricevere dati attuali" },
-]);
+/*
+ * Env:
+ *   TELEGRAM_TOKEN, chatID, MY_SOLAR_EDGE_SITE, SE_CLIENT_ID, SE_CLIENT_SECRET
+ *   POLLING_RATE_SEC        how often to check SolarEdge (default 1800 = 30 min)
+ *   ACTIVE_HOURS            local hours to poll in, "start-end" (default "8-18")
+ *   MINUTES_BEFORE_UPDATE   min gap between two export alerts (default 120)
+ * Free tier budget: 2000 credits/month; each check costs 2.
+ */
 
-/* HANDLE MESSAGES */
+const POLL_SEC = parseInt(process.env.POLLING_RATE_SEC || "1800");
+const [START_H, END_H] = (process.env.ACTIVE_HOURS || "8-18").split("-").map((n) => parseInt(n));
+const ALERT_GAP_MIN = parseInt(process.env.MINUTES_BEFORE_UPDATE || "120");
+const EXPORT_MIN_W = 300; // notify above this
+const EXPORT_WARN_W = 500;
+const EXPORT_ALARM_W = 2000;
+
+const bot = new Bot(process.env.TELEGRAM_TOKEN || "");
+const chatId = process.env.chatID + "";
+
+const kw = (w: number | null) => (w === null ? "n/d" : (w / 1000).toFixed(2));
+const hhmm = (ts: string | null) => (ts ? ts.slice(11, 16) : "?");
+
+const formatSnapshot = (s: Snapshot) => {
+  const lines: string[] = [];
+  if (s.exportW > EXPORT_ALARM_W) {
+    lines.push(`🚨🚨🚨Troppa energia in rete: <b>${kw(s.exportW)}kW</b> USALA!!🚨🚨🚨`);
+  } else if (s.exportW > EXPORT_WARN_W) {
+    lines.push(`⚠️Attenzione stai mandando energia in rete, <b>${kw(s.exportW)}kW</b>! Sfruttala ORA⚠️`);
+  }
+  lines.push(`STATO (media 15 min delle ${hhmm(s.timestamp)}):`);
+  lines.push(`Sun Power 🌤️: <b>${kw(s.pvW)}kW</b>`);
+  const batt = s.batteryPct === null ? "n/d" : `${Math.round(s.batteryPct)}%`;
+  const battFlow =
+    s.chargeW > 20 ? `in carica ${kw(s.chargeW)}kW` : s.dischargeW > 20 ? `in scarica ${kw(s.dischargeW)}kW` : "ferma";
+  lines.push(`Battery% 🔋: <b>${batt}</b>, ${battFlow}`);
+  lines.push(`Consumi 🏠: <b>${kw(s.loadW)}kW</b>`);
+  if (s.exportW > 20) lines.push(`Rete ⚡: immetti <b>${kw(s.exportW)}kW</b>`);
+  else if (s.importW > 20) lines.push(`Rete ⚡: prelevi <b>${kw(s.importW)}kW</b>`);
+  return lines.join("\n");
+};
+
+/* ERROR REPORTING: tell the chat once when things break and once when they recover. */
+let failing = false;
+const reportError = async (err: unknown) => {
+  const msg = err instanceof Error ? err.message : String(err);
+  console.error(`[${new Date().toISOString()}] ${msg}`);
+  if (failing) return;
+  failing = true;
+  const hint = err instanceof AuthError ? "\nServe rifare l'autorizzazione OAuth (scripts/authorize.mjs)." : "";
+  await bot.api.sendMessage(chatId, `❌ Errore SolarEdge: ${msg}${hint}`).catch(() => {});
+};
+const reportOk = async () => {
+  if (!failing) return;
+  failing = false;
+  await bot.api.sendMessage(chatId, "✅ SolarEdge di nuovo raggiungibile").catch(() => {});
+};
+
+/* COMMANDS */
 bot.command("yo", (ctx) => ctx.reply(`Yo ${ctx.from?.username}`));
 bot.command("now", async (ctx) => {
-  const msg = await getDataFromSolarEdge(true);
-  if (msg && msg != "KO") {
-    ctx.reply(msg, {
-      parse_mode: "HTML",
-    });
-  }
-});
-const introductionMessage = `/now per ricevere dati attuali\nLe notifiche imporanti te le mando io!\nOgni ora se mandi in rete più di 0.3kW\n(con warning se > 0.5kW; con alert se > 2kW)`;
-const replyWithIntro = (ctx: any) =>
-  ctx.reply(introductionMessage, { parse_mode: "HTML" });
-
-bot.command("start", replyWithIntro);
-bot.on("message", replyWithIntro);
-bot.catch((err: any) => {
-  console.log(err);
-  const chat = err.ctx.chat.id;
-  console.log(`Error for User <code>${chat}</code>: ${err.message}`);
-});
-
-/* API FETCH */
-const getDataFromSolarEdge = async (forcePrint = false) => {
   try {
-    console.log(
-      `[${new Date(
-        Date.now()
-      ).toDateString()}]Solar edge update execution... [forcePrint: ${forcePrint}]`
-    );
-    const isTimerElapsedFromlastUpdate = isEnd();
-    if(!isTimerElapsedFromlastUpdate &&  !forcePrint){
-      console.log("NO UPDATE TO DO: return");
-      return "KO";
+    const s = await getSnapshot();
+    await reportOk();
+    await ctx.reply(formatSnapshot(s), { parse_mode: "HTML" });
+  } catch (err) {
+    await reportError(err);
+    await ctx.reply("Non riesco a leggere i dati da SolarEdge in questo momento.");
+  }
+});
+const intro =
+  `/now per ricevere dati attuali (medie di 15 minuti, ~15 min di ritardo)\n` +
+  `Le notifiche importanti te le mando io!\n` +
+  `Controllo ogni ${Math.round(POLL_SEC / 60)} min dalle ${START_H} alle ${END_H}: ` +
+  `ti scrivo se mandi in rete più di ${EXPORT_MIN_W / 1000}kW ` +
+  `(warning se > ${EXPORT_WARN_W / 1000}kW, alert se > ${EXPORT_ALARM_W / 1000}kW)`;
+bot.command("start", (ctx) => ctx.reply(intro));
+bot.on("message", (ctx) => ctx.reply(intro));
+bot.catch((err) => console.error(`Telegram handler error: ${err.message}`));
+
+/* PERIODIC CHECK */
+let lastAlert = 0;
+const check = async () => {
+  const hour = new Date().getHours();
+  if (hour < START_H || hour >= END_H) return;
+  if (Date.now() - lastAlert < ALERT_GAP_MIN * 60 * 1000) return; // don't spend credits while muted
+  try {
+    const s = await getSnapshot();
+    await reportOk();
+    console.log(`[${new Date().toISOString()}] check: pv=${s.pvW} load=${s.loadW} export=${s.exportW} batt=${s.batteryPct}`);
+    if (s.exportW > EXPORT_MIN_W) {
+      lastAlert = Date.now();
+      await bot.api.sendMessage(chatId, formatSnapshot(s), { parse_mode: "HTML" });
     }
-    const url = `https://monitoringapi.solaredge.com/site/${process.env.MY_SOLAR_EDGE_SITE}/currentPowerFlow?api_key=${process.env.API_KEY}`;
-    //console.log(url);
-    console.log("CALLING SOLAREDGE");
-    const response = await axios.get(url);
-    let json = await response.data;
-    json = json["siteCurrentPowerFlow"];
-    // console.log(json);
-    const sun = json["PV"];
-    const battery = json["STORAGE"];
-    const load = json["LOAD"];
-    const grid = json["GRID"];
-
-    const sunValue = sun["currentPower"];
-    const batteryPerc = battery["chargeLevel"];
-    const loadValue = load["currentPower"];
-    const gridValue = grid["currentPower"];
-
-    const connections = json["connections"];
-
-    let sendingToGrid = false;
-    for (let i = 0; i < connections.length; i++) {
-      const c = connections[i];
-      console.log("connection found:", c);
-      if (c["to"].toUpperCase() == "GRID") {
-        sendingToGrid = true;
-        break;
-      }
-    }
-
-    console.log(
-      `CHECK: isEnd==true?:${isTimerElapsedFromlastUpdate}, sendingToGrid: ${sendingToGrid} , gridValue>0.3? : ${gridValue}`
-    );
-    if (
-      (isTimerElapsedFromlastUpdate && sendingToGrid && gridValue > 0.3) ||
-      forcePrint
-    ) {
-      start();
-    } else {
-      console.log("NO UPDATE TO DO: return");
-      return "KO";
-    }
-
-    /* SEND UPDATE */
-    console.log("\x1b[33m SENDING UPDATE! \x1b[0m");
-
-    const statusKey = "status";
-
-    const sunText = `Sun Power 🌤️: <b>${sunValue}kW</b>, stato: ${sun[statusKey]}`;
-    const batteryText = `Battery% 🔋: <b>${batteryPerc}%</b>, stato: ${battery[statusKey]}`;
-    const loadText = `Consumi 🏠: <b>${loadValue}kW</b>, stato: ${load[statusKey]}`;
-
-    const message = [sunText, batteryText, loadText];
-    let messageTxt = "";
-
-    if (sendingToGrid && gridValue > 2) {
-      messageTxt += `🚨🚨🚨Troppa energia in rete: <b>${gridValue}kW</b> USALA!!🚨🚨🚨\n`;
-    } else if (sendingToGrid && gridValue > 0.5) {
-      messageTxt += `⚠️Attenzione stai mandando energia in rete, <b>${gridValue}kW</b>! Sfruttala ORA⚠️\n`;
-    }
-    messageTxt += "STATO ATTUALE:\n";
-    messageTxt += message.join("\n");
-
-    return messageTxt;
-  } catch (error) {
-    console.log(error);
+  } catch (err) {
+    await reportError(err);
   }
 };
 
-/* TIMER PER POLLING A SOLAR EDGE */
-const pollingRateSec: any =
-  process.env.NODE_ENV === "production"
-    ? process.env.POLLING_RATE_SEC
-    : process.env.POLLING_RATE_SEC_DEV;
-const timer = new DuckTimer({ interval: pollingRateSec * 1000 }); // interval time in ms
-timer
-  .onInterval(async (res: any) => {
-    const msg = await getDataFromSolarEdge();
-    if (msg && msg != "KO") {
-      bot.api.sendMessage(process.env.chatID + "", msg, { parse_mode: "HTML" });
-    }
-  })
-  .start();
-var startTime: any, endTime: any;
+/* Keeps the 14-day refresh token alive even if checks are skipped for a long time. */
+const keepAlive = () => getSnapshot().then(reportOk).catch(reportError);
 
-const start = () => {
-  startTime = new Date();
-};
-
-const isEnd = () => {
-  /* RETURN TIME ELAPSED SINCE LAST PERIODIC UPDATE */
-
-  if (!startTime) return true; // TAKE ACTION [is the first time]
-
-  endTime = new Date();
-  var timeDiff = endTime - startTime; //in ms
-
-  // strip the ms -> seconds
-  var timeDiffSeconds = Math.round(timeDiff / 1000);
-
-  //hours
-  var timeDiffMinutes = Math.round(timeDiffSeconds / 60);
-
-  if (process.env.NODE_ENV === "production") {
-    const mustBe: number = parseInt(process.env.MINUTES_BEFORE_UPDATE + "");
-    //every hour
-    console.log(
-      "time elapsed: " + timeDiffMinutes + "min." + `[MUST BE >= : : ${mustBe}]`
-    );
-    if (timeDiffMinutes >= mustBe) {
-      return true;
-    }
-  } else {
-    //every 5 seconds
-    const mustBe: number = parseInt(process.env.SECONDS_BEFORE_UPDATE_DEV + "");
-    console.log(
-      "time elapsed: " + timeDiffSeconds + "sec." + `[MUST BE >= : ${mustBe}]`
-    );
-    if (timeDiffSeconds >= mustBe) {
-      return true;
-    }
-  }
-  return false; //NO ACTION
-};
-
-/* SERVER START */
-/*if (process.env.NODE_ENV === "production") {
-  // Use Webhooks for the production server
-  console.log("BOT RUNNING ON PRODUCTION");
-  const app = express();
-  app.use(express.json());
-  app.use(webhookCallback(bot, "express"));
-
-  const PORT = process.env.PORT || 3000;
-  app.listen(PORT, () => {
-    console.log(`Bot listening on port ${PORT}`);
-  });
-} else {*/
-console.log("BOT RUNNING ON PROD. POLLING");
-// Use Long Polling for development
-bot.start();
-//}
+if (process.argv.includes("--once")) {
+  // Local dry run: print one snapshot, no Telegram.
+  getSnapshot()
+    .then((s) => console.log(s, "\n\n" + formatSnapshot(s)))
+    .catch((e) => (console.error(e.message), process.exit(1)));
+} else {
+  setInterval(check, POLL_SEC * 1000);
+  setInterval(keepAlive, 3 * 24 * 3600 * 1000);
+  bot.api
+    .setMyCommands([
+      { command: "yo", description: "Be greeted by the bot" },
+      { command: "now", description: "per ricevere dati attuali" },
+    ])
+    .catch((e) => console.error(`setMyCommands failed: ${e.message}`));
+  check();
+  console.log(`Bot running: poll ${POLL_SEC}s, hours ${START_H}-${END_H}`);
+  bot.start();
+}

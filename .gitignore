@@ -1,4 +1,7 @@
-#dist
+dist
 .env
 node_modules
 .DS_Store
+env.txt
+tokens.json
+data/
